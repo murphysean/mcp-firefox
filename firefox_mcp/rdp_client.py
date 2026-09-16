@@ -32,10 +32,11 @@ class FirefoxRDPClient:
     async def connect(self):
         """Connect to Firefox and discover actors."""
         self._reader, self._writer = await asyncio.open_connection(self.host, self.port)
-        # Start background reader
-        self._reader_task = asyncio.create_task(self._read_loop())
-        # Firefox sends a greeting on connect - wait for it
+        # Firefox sends a greeting on connect - read it BEFORE starting the
+        # background read loop to avoid a race condition on the TCP stream.
         greeting = await self._recv_one()
+        # Now start the background reader for subsequent messages
+        self._reader_task = asyncio.create_task(self._read_loop())
         # Discover tabs and get target actors
         tabs_resp = await self.send(self.root_actor, "listTabs")
         if tabs := tabs_resp.get("tabs"):

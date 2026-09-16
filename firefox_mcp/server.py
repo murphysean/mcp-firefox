@@ -5,11 +5,11 @@ import json
 import os
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from .rdp_client import FirefoxRDPClient
 
-mcp = FastMCP("firefox-devtools", host="0.0.0.0", port=8090, stateless_http=True)
+mcp = MCPServer("firefox-devtools")
 
 # Global RDP client instance
 _client: FirefoxRDPClient | None = None
@@ -340,7 +340,7 @@ async def stop_capture() -> str:
 
 
 def main():
-    mcp.run(transport="streamable-http")
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=8090, stateless_http=True)
 
 
 if __name__ == "__main__":
