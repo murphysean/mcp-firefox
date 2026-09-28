@@ -11,15 +11,40 @@ dispatches every inbound packet:
 That distinction is the only reliable correlation mechanism: Firefox does not
 echo a ``requestId`` back to this protocol version, and actors emit both
 responses and events on the same connection.
+
+Actor model
+-----------
+
+Firefox has two overlapping actor generations:
+
+* the **legacy** surface (``root.listTabs``, ``tabDescriptor.getTarget``,
+  ``navigateTo`` on the tab descriptor) which Mozilla is retiring, and
+* the **watcher/target** surface (``getWatcher``, ``watchTargets``,
+  ``target-available-form``) used by its own DevTools front-end.
+
+This client uses the watcher/target surface as the single source of truth for
+per-tab actors, so there is exactly one code path for resolution, navigation and
+target switching.  Two legacy calls deliberately remain, because they are still
+the best available API for what they do:
+
+* ``root.listTabs`` — the only clean tab enumeration.  Watching frame targets
+  from the parent process also surfaces extension/worker frames and reports
+  ``isTopLevelTarget`` as false for real tabs, so it cannot replace this.
+* ``processDescriptor.getTarget`` — the unambiguous way to reach the parent
+  process (chrome) console, which privileged APIs such as ``drawSnapshot`` need.
+
+Everything else goes through :class:`TabSession`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 MAX_FRAME_BYTES = 64 * 1024 * 1024
@@ -28,15 +53,28 @@ MAX_FRAME_BYTES = 64 * 1024 * 1024
 DEFAULT_TIMEOUT = 30.0
 """Default seconds to wait for a request response."""
 
+MAX_INFLIGHT_PER_ACTOR = 64
+"""Back-pressure: cap queued requests per actor so a runaway caller cannot
+accumulate unbounded futures (and, because responses are matched FIFO, cannot
+silently corrupt correlation)."""
+
 LONG_STRING_CHUNK = 8192
 """Characters requested per ``substring`` call when draining a longString."""
 
 LONG_STRING_MAX_CHARS = 4 * 1024 * 1024
 """Cap on how much of a longString we materialise into Python memory."""
 
+TARGET_WAIT_TIMEOUT = 10.0
+"""How long to wait for a tab's initial target after subscribing."""
+
+NAVIGATE_TIMEOUT = 20.0
+"""How long to wait for the replacement target after a navigation."""
+
 # Matches a top-level `await` keyword that is not a property access such as
 # `foo.await` or an identifier like `awaited`.
 _AWAIT_RE = re.compile(r"(?:^|[^.\w$])await\s")
+
+_ABOUT_BLANK = "about:blank"
 
 
 class RDPError(Exception):
@@ -49,6 +87,10 @@ class RDPConnectionError(RDPError):
 
 class RDPTimeout(RDPError):
     """Firefox did not answer a request in time."""
+
+
+class RDPBackpressure(RDPError):
+    """Too many requests are already queued for one actor."""
 
 
 class RDPServerError(RDPError):
@@ -65,15 +107,78 @@ def _new_future() -> asyncio.Future[dict[str, Any]]:
     return asyncio.get_running_loop().create_future()
 
 
+def _new_signal() -> asyncio.Future[None]:
+    """A future used purely as a completion signal (resolved with None)."""
+    return asyncio.get_running_loop().create_future()
+
+
+@dataclass
+class TabSession:
+    """All actor state for one tab, resolved through the watcher/target protocol.
+
+    Keyed internally by the tab *descriptor* actor, which is stable across
+    navigation. The ``browsing_context_id`` is deliberately *not* the key: it
+    changes when Firefox switches targets on navigation (observed 13 -> 14),
+    which would orphan a bcID-keyed session and silently drop the replacement
+    target announcement.
+    """
+
+    tab_actor: str
+    browsing_context_id: int
+    title: str | None = None
+    url: str | None = None
+    selected: bool = False
+
+    watcher_actor: str | None = None
+    target_actor: str | None = None
+    console_actor: str | None = None
+    inspector_actor: str | None = None
+    network_actor: str | None = None
+
+    #: Resolved when the tab's target is available; swapped on navigation.
+    _target_ready: asyncio.Future[None] | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def ready(self) -> bool:
+        """True when the session can be used for page interaction."""
+        return self.target_actor is not None and self.console_actor is not None
+
+    def apply_target(self, target: dict[str, Any]) -> None:
+        """Adopt a target-available-form payload."""
+        self.target_actor = target.get("actor")
+        self.console_actor = target.get("consoleActor")
+        self.inspector_actor = target.get("inspectorActor")
+        self.network_actor = target.get("networkContentActor")
+        # Track the browsing context: Firefox allocates a new one on navigation.
+        bc_id = target.get("browsingContextID")
+        if isinstance(bc_id, int):
+            self.browsing_context_id = bc_id
+        self.title = target.get("title") or self.title
+        self.url = target.get("url") or self.url
+
+    def clear_target(self) -> None:
+        """Forget the target after it is destroyed (e.g. by a navigation)."""
+        self.target_actor = None
+        self.console_actor = None
+        self.inspector_actor = None
+        self.network_actor = None
+
+
 class FirefoxRDPClient:
     """Async client for Firefox's Remote Debugging Protocol over TCP."""
 
     def __init__(
-        self, host: str = "localhost", port: int = 6000, *, timeout: float = DEFAULT_TIMEOUT
+        self,
+        host: str = "localhost",
+        port: int = 6000,
+        *,
+        timeout: float = DEFAULT_TIMEOUT,
+        max_inflight_per_actor: int = MAX_INFLIGHT_PER_ACTOR,
     ):
         self.host = host
         self.port = port
         self.timeout = timeout
+        self.max_inflight_per_actor = max_inflight_per_actor
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -91,27 +196,30 @@ class FirefoxRDPClient:
         # Packets that matched neither a pending request nor a handler.
         self._unmatched: deque[dict[str, Any]] = deque(maxlen=200)
 
-        # Discovered actors.
+        # Tab sessions, keyed by the stable tab-descriptor actor.
+        self._sessions: dict[str, TabSession] = {}
+        self._sessions_by_bc: dict[int, TabSession] = {}
+        self.active_tab_actor: str | None = None
+
         self.root_actor: str = "root"
-        self.tab_actor: str | None = None
-        self.target_actor: str | None = None
-        self.console_actor: str | None = None
-        self.inspector_actor: str | None = None
-        self.network_actor: str | None = None
         self.process_actor: str | None = None
         self.chrome_console_actor: str | None = None
 
     # ------------------------------------------------------------------ setup
 
     async def connect(self) -> dict[str, Any]:
-        """Connect to Firefox, consume the greeting, and resolve actors."""
+        """Connect to Firefox and consume the greeting.
+
+        Actor resolution is lazy: the first tool call opens a tab session.
+        """
         self._reader, self._writer = await asyncio.open_connection(self.host, self.port)
         # Firefox pushes a greeting immediately on connect. Read it *before*
         # starting the read loop so the loop cannot swallow it.
         greeting = await self._read_frame()
         self._closed = False
         self._reader_task = asyncio.create_task(self._read_loop(), name="firefox-rdp-reader")
-        await self.resolve_actors()
+        self.on_event("target-available-form", self._on_target_available)
+        self.on_event("target-destroyed-form", self._on_target_destroyed)
         return greeting
 
     async def disconnect(self) -> None:
@@ -119,19 +227,19 @@ class FirefoxRDPClient:
         self._closed = True
         if self._reader_task is not None:
             self._reader_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._reader_task
-            except (asyncio.CancelledError, Exception):
-                pass
             self._reader_task = None
         if self._writer is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._writer.close()
                 await self._writer.wait_closed()
-            except Exception:
-                pass
         self._writer = None
         self._reader = None
+        self._sessions.clear()
+        self._sessions_by_bc.clear()
+        self.active_tab_actor = None
+        self.chrome_console_actor = None
         self._fail_in_flight(RDPConnectionError("disconnected"))
 
     @property
@@ -160,10 +268,54 @@ class FirefoxRDPClient:
         handlers = self._event_handlers.get(event_type)
         if not handlers:
             return
-        if handler in handlers:
+        with contextlib.suppress(ValueError):
             handlers.remove(handler)
         if not handlers:
             self._event_handlers.pop(event_type, None)
+
+    def _on_target_available(self, msg: dict[str, Any]) -> None:
+        """Adopt a new target for the matching tab (includes post-navigation).
+
+        Correlated by the event's *sender*: Firefox delivers target events from
+        the tab's watcher actor, which is stable across navigation, whereas the
+        target's ``browsingContextID`` changes when switching targets.
+        """
+        target = msg.get("target")
+        if not isinstance(target, dict):
+            return
+        sender = msg.get("from")
+        session = self._session_for_watcher(sender)
+        if session is None:
+            bc_id = target.get("browsingContextID")
+            if isinstance(bc_id, int):
+                session = self._sessions_by_bc.get(bc_id)
+        if session is None:
+            return
+        session.apply_target(target)
+        ready = session._target_ready
+        if ready is not None and not ready.done():
+            ready.set_result(None)
+
+    def _on_target_destroyed(self, msg: dict[str, Any]) -> None:
+        """Invalidate the target that Firefox just tore down."""
+        target = msg.get("target")
+        if not isinstance(target, dict):
+            return
+        actor = target.get("actor")
+        if not isinstance(actor, str):
+            return
+        for session in self._sessions.values():
+            if session.target_actor == actor:
+                session.clear_target()
+
+    def _session_for_watcher(self, sender: Any) -> TabSession | None:
+        """Map a watcher actor id back to its tab session."""
+        if not isinstance(sender, str):
+            return None
+        for session in self._sessions.values():
+            if session.watcher_actor == sender:
+                return session
+        return None
 
     # ---------------------------------------------------------------- requests
 
@@ -190,8 +342,17 @@ class FirefoxRDPClient:
         if not self.connected:
             raise RDPConnectionError("not connected to Firefox")
 
-        fut = _new_future()
         queue = self._pending.setdefault(to, deque())
+        if len(queue) >= self.max_inflight_per_actor:
+            # Back-pressure rather than unbounded growth. Also protects
+            # correlation: responses are matched FIFO, so an arbitrarily deep
+            # queue would make a late timeout far more likely.
+            raise RDPBackpressure(
+                f"{len(queue)} requests already in flight for actor '{to}' "
+                f"(limit {self.max_inflight_per_actor})"
+            )
+
+        fut = _new_future()
         queue.append(fut)
         try:
             await self._send(msg)
@@ -199,6 +360,8 @@ class FirefoxRDPClient:
         except TimeoutError as exc:
             raise RDPTimeout(f"no response from actor '{to}' for '{msg.get('type')}'") from exc
         finally:
+            # Runs on cancellation too, so an abandoned request cannot linger and
+            # steal the next response for this actor.
             _discard(queue, fut)
             if not queue:
                 self._pending.pop(to, None)
@@ -245,8 +408,13 @@ class FirefoxRDPClient:
     async def _evaluate_once(
         self, actor: str, expression: str, await_promise: bool, timeout: float | None
     ) -> dict[str, Any]:
-        fut = _new_future()
         waiters = self._eval_waiters.setdefault(actor, deque())
+        if len(waiters) >= self.max_inflight_per_actor:
+            raise RDPBackpressure(
+                f"{len(waiters)} evaluations already in flight for actor '{actor}' "
+                f"(limit {self.max_inflight_per_actor})"
+            )
+        fut = _new_future()
         waiters.append(fut)  # registered before send so no result can be missed
         try:
             ack = await self.send(
@@ -305,47 +473,114 @@ class FirefoxRDPClient:
     # ------------------------------------------------------------------- tabs
 
     async def list_tabs(self) -> list[dict[str, Any]]:
-        """Return Firefox's open tabs."""
+        """Return Firefox's open tabs (legacy enumeration — see module docstring)."""
         resp = await self.send(self.root_actor, "listTabs")
         tabs = resp.get("tabs")
-        return tabs if isinstance(tabs, list) else []
+        return [t for t in tabs if isinstance(t, dict)] if isinstance(tabs, list) else []
 
-    async def resolve_actors(self, tab_actor: str | None = None) -> dict[str, Any]:
-        """Resolve the actor ids for a tab (defaults to the active tab)."""
-        if tab_actor is not None:
-            self.tab_actor = tab_actor
-        if self.tab_actor is None:
-            tabs = await self.list_tabs()
-            if not tabs:
-                self._clear_actors()
-                return {}
-            self.tab_actor = str(tabs[0]["actor"])
+    async def use_tab(self, index: int = 0) -> TabSession:
+        """Make the tab at ``index`` active, opening a session for it if needed.
 
-        target = await self.send(self.tab_actor, "getTarget")
-        frame = target.get("frame")
-        if not isinstance(frame, dict):
-            self._clear_actors()
-            return {}
-        self.target_actor = frame.get("actor")
-        self.console_actor = frame.get("consoleActor")
-        self.inspector_actor = frame.get("inspectorActor")
-        self.network_actor = frame.get("networkContentActor")
-        return frame
-
-    async def select_tab(self, index: int = 0) -> dict[str, Any]:
-        """Switch the client to the tab at ``index`` and resolve its actors."""
+        Actors are resolved through the watcher/target protocol, not
+        ``tabDescriptor.getTarget``.
+        """
         tabs = await self.list_tabs()
         if not tabs:
             raise RDPError("no tabs are open")
         if not 0 <= index < len(tabs):
             raise RDPError(f"tab index {index} out of range (0-{len(tabs) - 1})")
-        self.tab_actor = str(tabs[index]["actor"])
-        self.chrome_console_actor = None
-        frame = await self.resolve_actors()
-        return {"index": index, "tab": tabs[index], "frame": frame}
+
+        tab = tabs[index]
+        bc_id = tab.get("browsingContextID")
+        tab_actor = tab.get("actor")
+        if not isinstance(bc_id, int) or not isinstance(tab_actor, str):
+            raise RDPError("tab descriptor is missing browsingContextID/actor")
+
+        session = self._sessions.get(tab_actor)
+        if session is None:
+            session = TabSession(tab_actor=tab_actor, browsing_context_id=bc_id)
+            self._sessions[tab_actor] = session
+        session.title = tab.get("title") or session.title
+        session.url = tab.get("url") or session.url
+        session.selected = bool(tab.get("selected"))
+        self._sessions_by_bc[session.browsing_context_id] = session
+
+        self.active_tab_actor = tab_actor
+        if not session.ready:
+            await self._open_session(session)
+        return session
+
+    async def _open_session(self, session: TabSession) -> None:
+        """Subscribe a tab's watcher and wait for its first target."""
+        ready = _new_signal()
+        session._target_ready = ready
+        try:
+            watcher = await self.send(
+                session.tab_actor,
+                "getWatcher",
+                # Without this Firefox emits no target events at all, and
+                # navigation does not hand us a replacement target.
+                isServerTargetSwitchingEnabled=True,
+                isPopupDebuggingEnabled=False,
+            )
+            watcher_actor = watcher.get("actor")
+            if not watcher_actor:
+                raise RDPError("could not resolve a watcher actor for the tab")
+            session.watcher_actor = str(watcher_actor)
+
+            # The first target arrives as an event, so subscribe then wait.
+            await self.send(session.watcher_actor, "watchTargets", targetType="frame")
+            try:
+                await asyncio.wait_for(asyncio.shield(ready), TARGET_WAIT_TIMEOUT)
+            except TimeoutError as exc:
+                raise RDPTimeout(
+                    f"no target became available for tab {session.browsing_context_id} "
+                    f"within {TARGET_WAIT_TIMEOUT}s"
+                ) from exc
+        finally:
+            session._target_ready = None
+
+    async def navigate(self, url: str, timeout: float = NAVIGATE_TIMEOUT) -> TabSession:
+        """Navigate the active tab and wait for the replacement target.
+
+        Navigation destroys the current target and Firefox hands us a new one for
+        the same browsing context, so this waits for that handoff — otherwise the
+        next call would race against a dead actor.
+        """
+        session = await self.active_session()
+        # Capture the actor *before* subscribing to the handoff: once Firefox
+        # destroys the target the field is cleared by the event handler.
+        target_actor = session.target_actor
+        if not target_actor:
+            raise RDPError("tab has no target actor; is it still open?")
+
+        ready = _new_signal()
+        session._target_ready = ready
+        try:
+            await self.send(target_actor, "navigateTo", url=url)
+            await asyncio.wait_for(asyncio.shield(ready), timeout)
+        except TimeoutError as exc:
+            raise RDPTimeout(f"no replacement target after navigating to {url}") from exc
+        finally:
+            session._target_ready = None
+        return session
+
+    async def active_session(self) -> TabSession:
+        """Return the active tab's session, opening one if necessary."""
+        if self.active_tab_actor is not None:
+            session = self._sessions.get(self.active_tab_actor)
+            if session is not None and session.ready:
+                return session
+        return await self.use_tab(0)
 
     async def ensure_chrome_console(self) -> str:
-        """Resolve the parent-process (chrome) console actor, for privileged APIs."""
+        """Resolve the parent-process (chrome) console actor, for privileged APIs.
+
+        This keeps the legacy ``getTarget`` call: ``getProcess(id=0)`` is
+        explicitly the parent process, so its target is unambiguous.  Watching
+        process targets instead returns several candidates with no reliable way
+        to tell which is the parent.
+        """
         if self.chrome_console_actor is not None:
             return self.chrome_console_actor
         if self.process_actor is None:
@@ -365,16 +600,12 @@ class FirefoxRDPClient:
         self.chrome_console_actor = str(console)
         return self.chrome_console_actor
 
-    def invalidate_target(self) -> None:
-        """Forget tab-scoped actors after a navigation invalidates them."""
-        self._clear_actors()
+    def forget_sessions(self) -> None:
+        """Drop all cached tab sessions (they will be re-resolved on demand)."""
+        self._sessions.clear()
+        self._sessions_by_bc.clear()
+        self.active_tab_actor = None
         self.chrome_console_actor = None
-
-    def _clear_actors(self) -> None:
-        self.target_actor = None
-        self.console_actor = None
-        self.inspector_actor = None
-        self.network_actor = None
 
     # ------------------------------------------------------------- transport
 
@@ -464,6 +695,10 @@ class FirefoxRDPClient:
                         fut.set_exception(exc)
         self._pending.clear()
         self._eval_waiters.clear()
+        for session in self._sessions.values():
+            ready = session._target_ready
+            if ready is not None and not ready.done():
+                ready.set_exception(exc)
 
 
 def _resolve_oldest(
@@ -483,10 +718,8 @@ def _resolve_oldest(
 def _discard(
     queue: deque[asyncio.Future[dict[str, Any]]], fut: asyncio.Future[dict[str, Any]]
 ) -> None:
-    try:
+    with contextlib.suppress(ValueError):
         queue.remove(fut)
-    except ValueError:
-        pass
 
 
 def _is_top_level_await_rejection(msg: dict[str, Any]) -> bool:

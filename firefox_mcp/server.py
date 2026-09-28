@@ -15,6 +15,7 @@ from .rdp_client import (
     FirefoxRDPClient,
     RDPError,
     RDPTimeout,
+    TabSession,
 )
 
 mcp = MCPServer("firefox-devtools")
@@ -41,21 +42,12 @@ def _error(exc: Exception) -> str:
     return _json({"error": type(exc).__name__, "message": str(exc)})
 
 
-def _ok(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    return _json(value)
-
-
 async def get_client() -> FirefoxRDPClient:
-    """Return a live client, reconnecting (and re-resolving actors) when stale."""
+    """Return a live client, reconnecting when the connection has died."""
     global _client
     if _client is None or not _client.connected:
         _client = FirefoxRDPClient(DEFAULT_RDP_HOST, DEFAULT_RDP_PORT)
         await _client.connect()
-        return _client
-    if _client.target_actor is None:
-        await _client.resolve_actors()
     return _client
 
 
@@ -65,6 +57,20 @@ async def _reset_client() -> None:
     if _client is not None:
         await _client.disconnect()
     _client = None
+
+
+async def _session(tab_index: int | None = None) -> TabSession:
+    """Resolve the tab session a tool should operate on."""
+    client = await get_client()
+    if tab_index is not None:
+        return await client.use_tab(tab_index)
+    return await client.active_session()
+
+
+def _require_console(session: TabSession) -> str:
+    if not session.console_actor:
+        raise RDPError("no console actor for the current tab; is a page loaded?")
+    return session.console_actor
 
 
 # ---------------------------------------------------------------- page tools
@@ -79,28 +85,31 @@ async def evaluate_js(expression: str, tab_index: int | None = None) -> str:
     top-level `await` is re-wrapped in an async function on your behalf — so
     `await fetch(...).then(r => r.json())` works even though Firefox's console
     rejects a bare top-level await.
+
+    Note: a non-primitive result comes back as an RDP object *grip* (a reference
+    plus a small preview), not the full value. Use `JSON.stringify(...)` for a
+    plain string, or navigate the grip with `raw_rdp_command`.
     """
     try:
+        session = await _session(tab_index)
         client = await get_client()
-        if tab_index is not None:
-            await client.select_tab(tab_index)
-        if not client.console_actor:
-            return _json({"error": "NoContent", "message": "no console actor; is a page loaded?"})
-        return _json(await client.evaluate(client.console_actor, expression))
+        return _json(await client.evaluate(_require_console(session), expression))
     except Exception as exc:
         return _error(exc)
 
 
 @mcp.tool()
 async def list_tabs() -> str:
-    """List all open browser tabs with their index, title, URL and actor id.
+    """List all open browser tabs with their index, title, URL and selected state.
 
     Use the returned `index` with other tools' `tab_index` argument to target a
-    specific tab.
+    specific tab. Indices shift as tabs open and close, so re-resolve before
+    relying on one.
     """
     try:
         client = await get_client()
         tabs = await client.list_tabs()
+        active = client.active_tab_actor
         return _json(
             [
                 {
@@ -108,7 +117,7 @@ async def list_tabs() -> str:
                     "title": t.get("title"),
                     "url": t.get("url"),
                     "selected": t.get("selected", False),
-                    "actor": t.get("actor"),
+                    "is_active_target": t.get("actor") == active,
                 }
                 for i, t in enumerate(tabs)
             ]
@@ -126,10 +135,15 @@ async def select_tab(index: int = 0) -> str:
     """
     try:
         client = await get_client()
-        info = await client.select_tab(index)
-        tab = info.get("tab", {})
+        session = await client.use_tab(index)
         return _json(
-            {"status": "selected", "index": index, "title": tab.get("title"), "url": tab.get("url")}
+            {
+                "status": "selected",
+                "index": index,
+                "title": session.title,
+                "url": session.url,
+                "browsing_context_id": session.browsing_context_id,
+            }
         )
     except Exception as exc:
         return _error(exc)
@@ -139,20 +153,16 @@ async def select_tab(index: int = 0) -> str:
 async def navigate(url: str, tab_index: int | None = None) -> str:
     """Navigate the current tab to a URL.
 
-    Actors change after navigation; they are re-resolved automatically, so
-    subsequent tool calls work without any extra step.
+    Firefox destroys the tab's debugging target on navigation and issues a
+    replacement, so this waits for the handoff before returning. That means the
+    very next tool call sees the new page rather than a dead actor.
     """
     try:
         client = await get_client()
         if tab_index is not None:
-            await client.select_tab(tab_index)
-        if not client.target_actor:
-            return _json({"error": "NoTarget", "message": "no target actor; is a page loaded?"})
-        await client.send(client.target_actor, "navigateTo", url=url)
-        # Navigation invalidates every child actor; forget them so the next call
-        # re-resolves against the new document.
-        client.invalidate_target()
-        return _json({"status": "navigated", "url": url})
+            await client.use_tab(tab_index)
+        session = await client.navigate(url)
+        return _json({"status": "navigated", "url": url, "title": session.title})
     except Exception as exc:
         return _error(exc)
 
@@ -162,11 +172,10 @@ async def get_page_source(tab_index: int | None = None) -> str:
     """Return the current page's full HTML source."""
     try:
         client = await get_client()
-        if tab_index is not None:
-            await client.select_tab(tab_index)
-        if not client.console_actor:
-            return _json({"error": "NoContent", "message": "no console actor; is a page loaded?"})
-        resp = await client.evaluate(client.console_actor, "document.documentElement.outerHTML")
+        session = await _session(tab_index)
+        resp = await client.evaluate(
+            _require_console(session), "document.documentElement.outerHTML"
+        )
         if resp.get("hasException"):
             return _json({"error": "EvaluationError", "message": resp.get("exceptionMessage")})
         result = resp.get("result")
@@ -180,16 +189,13 @@ async def get_console_messages(tab_index: int | None = None) -> str:
     """Get cached console messages (page errors and console API calls) for the current tab."""
     try:
         client = await get_client()
-        if tab_index is not None:
-            await client.select_tab(tab_index)
-        if not client.console_actor:
-            return _json({"error": "NoContent", "message": "no console actor; is a page loaded?"})
+        session = await _session(tab_index)
         resp = await client.send(
-            client.console_actor,
+            _require_console(session),
             "getCachedMessages",
             messageTypes=["PageError", "ConsoleAPI"],
         )
-        return _json(resp)
+        return _json(resp.get("messages", []))
     except Exception as exc:
         return _error(exc)
 
@@ -233,11 +239,8 @@ async def read_page(tab_index: int | None = None) -> str:
     """
     try:
         client = await get_client()
-        if tab_index is not None:
-            await client.select_tab(tab_index)
-        if not client.console_actor:
-            return _json({"error": "NoContent", "message": "no console actor; is a page loaded?"})
-        resp = await client.evaluate(client.console_actor, _READ_PAGE_JS)
+        session = await _session(tab_index)
+        resp = await client.evaluate(_require_console(session), _READ_PAGE_JS)
         if resp.get("hasException"):
             return _json({"error": "EvaluationError", "message": resp.get("exceptionMessage")})
         result = resp.get("result")
@@ -287,6 +290,50 @@ _SNAPSHOT_JS = """(async () => {{
 }})()"""
 
 
+async def _measure_selector(client: FirefoxRDPClient, session: TabSession, selector: str) -> str:
+    """Return a JS DOMRect literal for ``selector``, or raise if unmeasurable."""
+    console = _require_console(session)
+    rect_js = (
+        "(() => { const el = document.querySelector("
+        + json.dumps(selector)
+        + "); if (!el) return null; const r = el.getBoundingClientRect();"
+        + " return JSON.stringify({x: r.x, y: r.y, width: r.width, height: r.height}); })()"
+    )
+    resp = await client.evaluate(console, rect_js)
+    rect_raw = resp.get("result")
+    if not rect_raw or rect_raw == "null":
+        raise RDPError(f"no element matches {selector!r}")
+    try:
+        rect = json.loads(rect_raw)
+    except (TypeError, ValueError) as exc:
+        raise RDPError(f"could not measure {selector!r}") from exc
+    if not rect.get("width") or not rect.get("height"):
+        raise RDPError(f"{selector!r} has zero size and cannot be captured")
+    return "new DOMRect({x}, {y}, {width}, {height})".format(**rect)
+
+
+async def _measure_fullpage(client: FirefoxRDPClient, session: TabSession) -> str:
+    """Return a JS DOMRect literal covering the whole scrollable page."""
+    resp = await client.evaluate(
+        _require_console(session),
+        "JSON.stringify({"
+        "w: Math.max(document.documentElement.scrollWidth,"
+        " document.documentElement.clientWidth),"
+        "h: Math.max(document.documentElement.scrollHeight,"
+        " document.documentElement.clientHeight)"
+        "})",
+    )
+    try:
+        size = json.loads(resp.get("result") or "{}")
+        if not isinstance(size, dict):
+            size = {}
+    except (TypeError, ValueError):
+        size = {}
+    if not size.get("w") or not size.get("h"):
+        raise RDPError("could not measure the page")
+    return f"new DOMRect(0, 0, {size['w']}, {size['h']})"
+
+
 @mcp.tool()
 async def screenshot(
     selector: str = "",
@@ -297,9 +344,9 @@ async def screenshot(
 ) -> str:
     """Take a screenshot of the current tab.
 
-    Works by asking Firefox's parent process to rasterise the tab's window
-    global, so it captures real rendered pixels (including anything drawn by the
-    compositor) rather than a DOM reconstruction.
+    Capture happens in Firefox's parent process, which rasterises the tab's
+    window global — so this captures real rendered pixels rather than a DOM
+    reconstruction. Requires `devtools.chrome.enabled=true` in about:config.
 
     Args:
         selector: CSS selector to capture a single element. Empty = whole viewport.
@@ -315,82 +362,25 @@ async def screenshot(
     """
     try:
         client = await get_client()
-        if tab_index is not None:
-            await client.select_tab(tab_index)
-        await client.resolve_actors()
-
-        tabs = await client.list_tabs()
-        target_tab = next((t for t in tabs if t.get("actor") == client.tab_actor), None)
-        if target_tab is None:
-            return _json({"error": "NoTab", "message": "target tab is no longer open"})
-        browsing_context_id = target_tab.get("browsingContextID")
-        if browsing_context_id is None:
-            return _json({"error": "NoBrowsingContext", "message": "tab has no browsingContextID"})
+        session = await _session(tab_index)
 
         if selector:
-            if not client.console_actor:
-                return _json(
-                    {"error": "NoContent", "message": "no console actor; is a page loaded?"}
-                )
-            rect_js = (
-                "(() => { const el = document.querySelector("
-                + json.dumps(selector)
-                + "); if (!el) return null; const r = el.getBoundingClientRect();"
-                + " return JSON.stringify({x: r.x, y: r.y, width: r.width, height: r.height}); })()"
-            )
-            rect_resp = await client.evaluate(client.console_actor, rect_js)
-            rect_raw = rect_resp.get("result")
-            if not rect_raw or rect_raw == "null":
-                return _json(
-                    {"error": "SelectorNotFound", "message": f"no element matches {selector!r}"}
-                )
-            try:
-                r = json.loads(rect_raw)
-            except (TypeError, ValueError):
-                return _json(
-                    {"error": "SelectorNotFound", "message": f"could not measure {selector!r}"}
-                )
-            if not r.get("width") or not r.get("height"):
-                return _json(
-                    {
-                        "error": "ZeroSize",
-                        "message": f"{selector!r} has zero size and cannot be captured",
-                    }
-                )
-            rect = "new DOMRect({x}, {y}, {width}, {height})".format(**r)
+            rect = await _measure_selector(client, session, selector)
+            options = ""
         elif fullpage:
-            if not client.console_actor:
-                return _json(
-                    {"error": "NoContent", "message": "no console actor; is a page loaded?"}
-                )
-            size_resp = await client.evaluate(
-                client.console_actor,
-                "JSON.stringify({"
-                "w: Math.max(document.documentElement.scrollWidth,"
-                " document.documentElement.clientWidth),"
-                "h: Math.max(document.documentElement.scrollHeight,"
-                " document.documentElement.clientHeight)"
-                "})",
-            )
-            try:
-                size = json.loads(size_resp.get("result") or "{}")
-                if not isinstance(size, dict):
-                    size = {}
-            except (TypeError, ValueError):
-                size = {}
-            if not size.get("w") or not size.get("h"):
-                return _json({"error": "ZeroSize", "message": "could not measure the page"})
-            rect = f"new DOMRect(0, 0, {size['w']}, {size['h']})"
+            rect = await _measure_fullpage(client, session)
+            options = ", {inScrollView: false}"
         else:
             rect = "null"
+            options = ""
 
         # drawSnapshot lives in the parent process, so this must run against the
         # chrome console, not the content console.
         chrome_console = await client.ensure_chrome_console()
         js = _SNAPSHOT_JS.format(
-            browsing_context_id=browsing_context_id,
+            browsing_context_id=session.browsing_context_id,
             rect=rect,
-            options=", {inScrollView: false}" if fullpage else "",
+            options=options,
             image_type=image_type,
         )
         resp = await client.evaluate(chrome_console, js)
@@ -412,32 +402,39 @@ async def screenshot(
         else:
             return _json({"error": "ScreenshotFailed", "message": "unexpected empty result"})
 
-        data_url = payload.get("data_url", "")
+        if not payload.get("data_url"):
+            return _json({"error": "ScreenshotFailed", "message": "no image data returned"})
+
         if save_path:
-            header, _, b64 = data_url.partition(",")
-            try:
-                blob = base64.b64decode(b64)
-            except (binascii.Error, ValueError) as exc:
-                return _json({"error": "ScreenshotFailed", "message": f"bad base64: {exc}"})
-            try:
-                with open(save_path, "wb") as fh:
-                    fh.write(blob)
-            except OSError as exc:
-                return _json({"error": "WriteFailed", "message": str(exc)})
-            return _json(
-                {
-                    "path": save_path,
-                    "bytes": len(blob),
-                    "width": payload.get("width"),
-                    "height": payload.get("height"),
-                    "content_type": header.removeprefix("data:").split(";")[0]
-                    if header
-                    else image_type,
-                }
-            )
+            return _json(await _write_image(payload, save_path, image_type))
         return _json(payload)
+    except RDPError as exc:
+        return _json({"error": type(exc).__name__, "message": str(exc)})
     except Exception as exc:
         return _error(exc)
+
+
+async def _write_image(payload: dict[str, Any], save_path: str, image_type: str) -> dict[str, Any]:
+    """Decode a data URL to disk and describe the result (no base64 in reply)."""
+    data_url = str(payload.get("data_url", ""))
+    header, _, b64 = data_url.partition(",")
+    try:
+        blob = base64.b64decode(b64)
+    except (binascii.Error, ValueError) as exc:
+        return {"error": "ScreenshotFailed", "message": f"bad base64: {exc}"}
+    try:
+        with open(save_path, "wb") as fh:
+            fh.write(blob)
+    except OSError as exc:
+        return {"error": "WriteFailed", "message": str(exc)}
+    kind = header.removeprefix("data:").split(";")[0] if header else image_type
+    return {
+        "path": save_path,
+        "bytes": len(blob),
+        "width": payload.get("width"),
+        "height": payload.get("height"),
+        "content_type": kind,
+    }
 
 
 # ----------------------------------------------------------- network capture
@@ -479,6 +476,7 @@ class _Capture:
         out = []
         for rid in self.order:
             ev = self.events[rid]
+            cause = ev.get("cause")
             out.append(
                 {
                     "url": ev.get("url"),
@@ -490,9 +488,7 @@ class _Capture:
                     "transferSize": ev.get("transferredSize"),
                     "started": ev.get("startedDateTime"),
                     "isXHR": ev.get("isXHR"),
-                    "cause": (ev.get("cause") or {}).get("type")
-                    if isinstance(ev.get("cause"), dict)
-                    else None,
+                    "cause": cause.get("type") if isinstance(cause, dict) else None,
                     "resourceId": rid,
                     "actor": ev.get("actor"),
                 }
@@ -533,24 +529,13 @@ async def start_capture(tab_index: int | None = None) -> str:
     global _capture
     try:
         client = await get_client()
-        if tab_index is not None:
-            await client.select_tab(tab_index)
+        session = await _session(tab_index)
         if _capture is not None:
             return _json({"status": "already_capturing", "events_so_far": len(_capture.order)})
-        if not client.tab_actor:
-            return _json({"error": "NoTab", "message": "no tab is open"})
+        if not session.watcher_actor:
+            return _json({"error": "NoWatcher", "message": "tab has no watcher actor"})
 
-        watcher_resp = await client.send(
-            client.tab_actor,
-            "getWatcher",
-            isServerTargetSwitchingEnabled=True,
-            isPopupDebuggingEnabled=False,
-        )
-        watcher_actor = watcher_resp.get("actor")
-        if not watcher_actor:
-            return _json({"error": "NoWatcher", "message": "could not resolve a watcher actor"})
-
-        capture = _Capture(watcher_actor=str(watcher_actor))
+        capture = _Capture(watcher_actor=session.watcher_actor)
 
         def _on_available(msg: dict[str, Any]) -> None:
             capture.add(_capture_entries(msg))
@@ -561,11 +546,10 @@ async def start_capture(tab_index: int | None = None) -> str:
         client.on_event("resources-available-array", _on_available)
         client.on_event("resources-updated-array", _on_updated)
 
-        await client.send(watcher_actor, "watchTargets", targetType="frame")
-        await client.send(watcher_actor, "watchResources", resourceTypes=["network-event"])
+        await client.send(session.watcher_actor, "watchResources", resourceTypes=["network-event"])
 
         _capture = capture
-        return _json({"status": "capturing", "watcher": watcher_actor})
+        return _json({"status": "capturing", "watcher": session.watcher_actor})
     except Exception as exc:
         return _error(exc)
 
@@ -578,8 +562,8 @@ async def read_capture(include_bodies: bool = False, only_errors: bool = False) 
         include_bodies: Also fetch response bodies (slower; capped per body).
         only_errors: Only return responses that failed or returned status >= 400.
 
-    Returns a summary per request: URL, method, status, content type, sizes,
-    timings and the resource id.
+    Returns a summary per request: URL, method, status, content type, sizes and
+    the resource id.
     """
     try:
         client = await get_client()
@@ -602,33 +586,38 @@ async def read_capture(include_bodies: bool = False, only_errors: bool = False) 
 
         if include_bodies:
             for entry in entries:
-                actor = entry.get("actor")
-                if not actor:
-                    continue
-                try:
-                    resp = await client.send(actor, "getResponseContent")
-                except (RDPError, RDPTimeout):
-                    entry["body"] = None
-                    continue
-                content = resp.get("content")
-                if not isinstance(content, dict):
-                    entry["body"] = None
-                    continue
-                text = content.get("text")
-                if isinstance(text, dict) and text.get("type") == "longString":
-                    try:
-                        text = await client.read_long_string(text, max_chars=MAX_BODY_CHARS)
-                    except (RDPError, RDPTimeout):
-                        text = None
-                if isinstance(text, str):
-                    entry["body"] = text[:MAX_BODY_CHARS]
-                elif text is None and resp.get("contentDiscarded"):
-                    entry["body"] = None
-                    entry["bodyDiscarded"] = True
+                await _attach_body(client, entry)
 
         return _json({"count": len(entries), "events": entries})
     except Exception as exc:
         return _error(exc)
+
+
+async def _attach_body(client: FirefoxRDPClient, entry: dict[str, Any]) -> None:
+    """Fetch and attach a response body, tolerating per-request failures."""
+    actor = entry.get("actor")
+    if not actor:
+        return
+    try:
+        resp = await client.send(str(actor), "getResponseContent")
+    except (RDPError, RDPTimeout):
+        entry["body"] = None
+        return
+    content = resp.get("content")
+    if not isinstance(content, dict):
+        entry["body"] = None
+        return
+    text: Any = content.get("text")
+    if isinstance(text, dict) and text.get("type") == "longString":
+        try:
+            text = await client.read_long_string(text, max_chars=MAX_BODY_CHARS)
+        except (RDPError, RDPTimeout):
+            text = None
+    if isinstance(text, str):
+        entry["body"] = text[:MAX_BODY_CHARS]
+    elif text is None and resp.get("contentDiscarded"):
+        entry["body"] = None
+        entry["bodyDiscarded"] = True
 
 
 @mcp.tool()
@@ -654,6 +643,7 @@ async def stop_capture() -> str:
                 await client.send(capture.watcher_actor, msg_type, timeout=2.0, **params)
             except (RDPError, RDPTimeout, TimeoutError):
                 pass
+
         client.remove_event("resources-available-array")
         client.remove_event("resources-updated-array")
 
@@ -664,9 +654,10 @@ async def stop_capture() -> str:
 
 @mcp.tool()
 async def reconnect() -> str:
-    """Drop the RDP connection and reconnect to Firefox on the next call.
+    """Drop the RDP connection and reconnect to Firefox.
 
     Useful after Firefox restarts, or when a tool reports a connection error.
+    Actor state is discarded, so the next tool call re-resolves the active tab.
     """
     try:
         await _reset_client()

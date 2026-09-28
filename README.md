@@ -24,6 +24,33 @@ That distinction is the only reliable correlation mechanism — Firefox does not
 connection. Getting it wrong is subtle: an event can resolve a request (hanging the caller), or
 a response can be swallowed as an event (hanging it *and* losing the data).
 
+### Actor model
+
+Firefox has two overlapping actor generations: the **legacy** surface (`listTabs`,
+`tabDescriptor.getTarget`, `navigateTo`) that Mozilla is retiring, and the **watcher/target**
+surface (`getWatcher`, `watchTargets`, `target-available-form`) used by its own DevTools
+front-end.
+
+This server uses the watcher/target surface as the single source of truth for per-tab actors, so
+resolution, navigation and target switching all go through one code path. Two legacy calls
+remain deliberately, because they are still the best API for what they do:
+
+| Call | Why it stays |
+|------|--------------|
+| `root.listTabs` | The only clean tab enumeration. Watching frame targets from the parent process also returns extension/worker frames and reports `isTopLevelTarget` as false for real tabs. |
+| `processDescriptor.getTarget` | The unambiguous route to the parent-process (chrome) console that `screenshot` needs. |
+
+Sessions are keyed by the stable **tab descriptor actor**, not by `browsingContextID` — Firefox
+allocates a *new* browsing context id when it switches targets on navigation, so a bcID-keyed
+session would be orphaned mid-navigation and silently drop the replacement target. Target events
+are correlated by their **sender** (the tab's watcher actor), which is stable across navigation.
+
+Navigation is transactional: `navigate` waits for the replacement target before returning, so the
+very next call works instead of racing a dead actor.
+
+Requests are capped per actor (back-pressure), and a cancelled request is removed from its queue
+so it cannot consume the next response meant for someone else.
+
 Promises are awaited for you, and a literal top-level `await` is automatically re-wrapped in an
 async function, because Firefox's console rejects a bare top-level `await` in a plain script.
 
@@ -225,15 +252,16 @@ uv run pytest                # tests
 
 The test suite uses an in-process fake Firefox (`tests/fake_firefox.py`) that reproduces the
 protocol's real quirks — nested resource batches, responses lacking a `type` key, interleaved
-events, and the watcher actor dying after `unwatchResources` — so most behaviour is covered
-without needing a browser.
+events, the watcher actor dying after `unwatchResources`, and Firefox allocating a **new
+browsing context id on navigation** — so most behaviour is covered without needing a browser.
 
 ## Notes & Limitations
 
-- **Legacy actor protocol.** The server uses Firefox's older actor surface (`listTabs`,
-  `getTarget`, `navigateTo`, `evaluateJSAsync`). It works on current Firefox (verified against
-  156), but Mozilla is gradually retiring parts of it in favour of the WebDriver BiDi-based
-  Remote Agent.
+- **Legacy actor protocol.** Tab enumeration and the chrome console still use the older actor
+  surface (`listTabs`, `processDescriptor.getTarget`). Everything else goes through the
+  watcher/target protocol and works on current Firefox (verified against 156), but Mozilla is
+  gradually retiring parts of the legacy surface in favour of the WebDriver BiDi-based Remote
+  Agent.
 - **One connection per server process.** All tabs are reached through a single RDP connection;
   tab targeting is by actor, not by separate sessions.
 - **Capture must start before the traffic.** Network capture only sees requests made after
@@ -241,4 +269,6 @@ without needing a browser.
 - **Object results are grips.** Evaluating an expression that returns a non-primitive yields an
   RDP object *grip* (a reference with a small preview), not the full serialised value. For a
   plain value, return a JSON string (`JSON.stringify(...)`) or a primitive from your expression.
+- **No request pre-emption.** Cancellation cleans up correctly (a cancelled request cannot steal
+  the next response), but a request already sent to Firefox still runs to completion there.
 - **No authentication.** See the security note under *Running*.

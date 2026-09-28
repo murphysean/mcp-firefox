@@ -2,15 +2,27 @@
 
 Implements just enough of the protocol to exercise the client: the greeting,
 length-prefixed framing, response/event discrimination (responses have no
-`type` key), interleaved events, and error packets.
+`type` key), interleaved events, error packets, and — importantly — the
+watcher/target protocol with the real lifecycle constraints:
+
+* `getWatcher` without ``isServerTargetSwitchingEnabled=True`` yields **no**
+  target events at all;
+* the tab target is announced asynchronously as ``target-available-form`` after
+  ``watchTargets(FRAME)``;
+* navigation destroys the target and announces a **new** target actor for the
+  same browsing context;
+* ``unwatchResources`` tears the watcher down, after which it stops answering.
 """
 
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 from collections.abc import Callable
 from typing import Any
+
+TAB_BC_ID = 10
 
 
 class FakeRDPFirefox:
@@ -22,18 +34,20 @@ class FakeRDPFirefox:
         self._client_writer: asyncio.StreamWriter | None = None
         self._handler_tasks: set[asyncio.Task[None]] = set()
         self._client_writers: list[asyncio.StreamWriter] = []
-        # handler: (msg, responder) -> None
+
         self.handlers: dict[str, Callable[[dict[str, Any], Responder], Any]] = {}
         self.received: list[dict[str, Any]] = []
+
         self.tabs: list[dict[str, Any]] = [
             {
                 "actor": "server1.tabDescriptor1",
-                "browsingContextID": 10,
+                "browsingContextID": TAB_BC_ID,
                 "selected": True,
                 "title": "Tab One",
                 "url": "https://example.com/",
             }
         ]
+
         self.on_connect: Callable[[Responder], Any] | None = None
         self.greeting: dict[str, Any] = {
             "from": "root",
@@ -41,10 +55,23 @@ class FakeRDPFirefox:
             "testConnectionPrefix": "server1.conn0.",
             "traits": {},
         }
-        # When set, the server crashes the handler for this message type.
+
         self.raise_on: set[str] = set()
-        # Mirrors Firefox: the watcher actor dies once resources are unwatched.
-        self.watcher_alive: bool = True
+
+        # Watcher/target state, mirroring Firefox's real behaviour.
+        self.watcher_seq = itertools.count(1)
+        self.target_seq = itertools.count(1)
+        self.actor_seq = itertools.count(1)
+        self.watcher_alive = True
+        self.switching_enabled = False
+        self.watching_frames = False
+        self.targets: dict[str, dict[str, Any]] = {}
+        self.current_target: dict[str, Any] | None = None
+        self.current_watcher_actor: str | None = None
+        # watcher actor -> owning tab info, so target announcements match the tab.
+        self.sessions: dict[str, dict[str, Any]] = {}
+        # Firefox allocates a fresh browsingContextID on navigation.
+        self.next_browsing_context_id = TAB_BC_ID + 1
 
     # ------------------------------------------------------------- lifecycle
 
@@ -77,10 +104,11 @@ class FakeRDPFirefox:
         self._handler_tasks.add(asyncio.current_task())
         self._client_writer = writer
         self._client_writers.append(writer)
+        root = Responder(self, writer, "root")
         try:
             await self._write(writer, self.greeting)
             if self.on_connect is not None:
-                await self.on_connect(Responder(self, writer, "root"))
+                await self.on_connect(root)
             while True:
                 msg = await self._read(reader)
                 if msg is None:
@@ -107,7 +135,8 @@ class FakeRDPFirefox:
         handler = self.handlers.get(msg_type)
         if handler is None:
             await responder.error(
-                "unrecognizedPacketType", f"Actor {responder.to} does not recognize {msg_type}"
+                "unrecognizedPacketType",
+                f"Actor {responder.to} does not recognize '{msg_type}'",
             )
             return
         result = handler(msg, responder)
@@ -134,6 +163,74 @@ class FakeRDPFirefox:
         parsed = json.loads(data)
         return parsed if isinstance(parsed, dict) else None
 
+    # ------------------------------------------------- watcher/target helpers
+
+    def make_target(
+        self,
+        *,
+        url: str | None = None,
+        title: str = "Tab One",
+        browsing_context_id: int = TAB_BC_ID,
+    ) -> dict[str, Any]:
+        """Mint a target actor the way Firefox does."""
+        n = next(self.target_seq)
+        suffix = next(self.actor_seq)
+        prefix = "server1.watcher2.process5//"
+        return {
+            "actor": f"{prefix}windowGlobalTarget{suffix}",
+            "targetType": "frame",
+            "browsingContextID": browsing_context_id,
+            "innerWindowId": 10_000 + n,
+            "isTopLevelTarget": True,
+            "isPopup": False,
+            "isPrivate": False,
+            "title": title,
+            "url": url or "https://example.com/",
+            "consoleActor": f"{prefix}consoleActor{suffix}",
+            "inspectorActor": f"{prefix}inspectorActor{suffix}",
+            "networkContentActor": f"{prefix}networkContentActor{suffix}",
+            "screenshotContentActor": f"{prefix}screenshotContentActor{suffix}",
+        }
+
+    async def announce_target(
+        self, writer: asyncio.StreamWriter, target: dict[str, Any], watcher_actor: str
+    ) -> None:
+        """Push a target-available-form for a newly adopted target.
+
+        The sender must be the tab's watcher actor: that is how a client
+        correlates target events to a tab, since the target's
+        browsingContextID changes on navigation.
+        """
+        self.targets[target["actor"]] = target
+        self.current_target = target
+        self.current_watcher_actor = watcher_actor
+        await self._write(
+            writer,
+            {"from": watcher_actor, "type": "target-available-form", "target": target},
+        )
+
+    async def destroy_current_target(self, writer: asyncio.StreamWriter) -> None:
+        """Push target-destroyed-form for the active target, as navigation does."""
+        target = self.current_target
+        if target is None:
+            return
+        sender = self.current_watcher_actor or "server1.watcher"
+        self.targets.pop(target["actor"], None)
+        self.current_target = None
+        await self._write(
+            writer,
+            {
+                "from": sender,
+                "type": "target-destroyed-form",
+                "target": {
+                    "actor": target["actor"],
+                    "innerWindowId": target["innerWindowId"],
+                    "isTopLevelTarget": True,
+                },
+                "options": {"isTargetSwitching": True},
+            },
+        )
+
 
 class Responder:
     """Server-side helper for answering one request."""
@@ -156,35 +253,130 @@ class Responder:
 
 
 def default_handlers(server: FakeRDPFirefox) -> None:
-    """Install the handlers that mirror a real Firefox instance."""
+    """Install handlers mirroring a real Firefox instance."""
 
     async def list_tabs(msg: dict[str, Any], r: Responder) -> None:
         await r.reply(tabs=server.tabs)
 
+    async def get_watcher(msg: dict[str, Any], r: Responder) -> None:
+        # Real Firefox emits no target events unless switching is enabled.
+        server.switching_enabled = bool(msg.get("isServerTargetSwitchingEnabled"))
+        server.watcher_alive = True
+        watcher = f"server1.watcher{next(server.watcher_seq)}"
+        # Remember which tab this watcher belongs to, so we can announce the
+        # matching target.
+        tab = next(
+            (t for t in server.tabs if t.get("actor") == r.to),
+            None,
+        )
+        if tab is not None:
+            server.sessions[watcher] = {
+                "browsing_context_id": tab.get("browsingContextID"),
+                "url": tab.get("url"),
+                "title": tab.get("title", "Tab One"),
+            }
+        await r.reply(actor=watcher, traits={})
+
+    async def watch_targets(msg: dict[str, Any], r: Responder) -> None:
+        if msg.get("targetType") != "frame":
+            await r.reply()
+            return
+        server.watching_frames = True
+        await r.reply()
+        if not server.switching_enabled:
+            return
+        # Firefox announces the target of the tab whose watcher we asked; the
+        # watcher actor is derived from that tab descriptor.
+        session = server.sessions.get(r.to)
+        browsing_context_id = session["browsing_context_id"] if session else TAB_BC_ID
+        await server.announce_target(
+            r.writer,
+            server.make_target(
+                browsing_context_id=browsing_context_id,
+                url=(session or {}).get("url"),
+                title=(session or {}).get("title", "Tab One"),
+            ),
+            r.to,
+        )
+
+    async def unwatch_targets(msg: dict[str, Any], r: Responder) -> None:
+        if not server.watcher_alive:
+            return  # actor is gone: no reply, exactly like the real thing
+        server.watching_frames = False
+        await r.reply()
+
+    async def unwatch_resources(msg: dict[str, Any], r: Responder) -> None:
+        # Faithful to Firefox: unwatching resources tears down the watcher actor,
+        # after which it stops answering anything else.
+        server.watcher_alive = False
+        await r.reply()
+
+    async def watch_resources(msg: dict[str, Any], r: Responder) -> None:
+        await r.reply()
+
+    async def navigate_to(msg: dict[str, Any], r: Responder) -> None:
+        target = server.current_target
+        # navigateTo is addressed to the target actor, but target events come
+        # from the watcher actor, so capture the watcher before replying.
+        watcher_actor = server.current_watcher_actor or "server1.watcher"
+        # Firefox tears the current target down and announces a replacement with
+        # a NEW browsingContextID for the same tab.
+        if target is not None:
+            await server.destroy_current_target(r.writer)
+        await r.reply()
+        server.tabs[0]["browsingContextID"] = server.next_browsing_context_id
+        server.next_browsing_context_id += 1
+        await server.announce_target(
+            r.writer,
+            server.make_target(
+                url=str(msg.get("url")),
+                title="Navigated",
+                browsing_context_id=server.tabs[0]["browsingContextID"],
+            ),
+            watcher_actor,
+        )
+        if server.tabs:
+            server.tabs[0]["url"] = str(msg.get("url", ""))
+            server.tabs[0]["title"] = "Navigated"
+
+    async def get_process(msg: dict[str, Any], r: Responder) -> None:
+        await r.reply(
+            processDescriptor={
+                "actor": "server1.processDescriptor3",
+                "id": msg.get("id", 0),
+                "isParent": True,
+            }
+        )
+
     async def get_target(msg: dict[str, Any], r: Responder) -> None:
-        # Real Firefox answers getTarget differently for a tab vs the parent
-        # process: a `frame` for the former, a `process` for the latter.
+        # Real Firefox answers differently for a tab vs the parent process: a
+        # `frame` for the former, a `process` for the latter.
         if r.to == "server1.processDescriptor3":
             await r.reply(
                 process={
-                    "actor": "server1.processTarget1",
+                    "actor": "server1.parentProcessTarget1",
                     "consoleActor": "server1.chromeConsole1",
                 }
             )
             return
+        target = server.current_target or server.make_target()
         await r.reply(
             frame={
-                "actor": "server1.child2/windowGlobalTarget2",
-                "consoleActor": "server1.child2/consoleActor3",
-                "inspectorActor": "server1.child2/inspectorActor4",
-                "networkContentActor": "server1.child2/networkContentActor14",
-                "url": "https://example.com/",
+                "actor": target["actor"],
+                "consoleActor": target["consoleActor"],
+                "inspectorActor": target["inspectorActor"],
+                "networkContentActor": target["networkContentActor"],
+                "url": target["url"],
             }
         )
 
     async def evaluate_js_async(msg: dict[str, Any], r: Responder) -> None:
         text = str(msg.get("text", ""))
-        rid = "rid-1"
+        # Only known console actors answer.
+        if "consoleActor" not in r.to and r.to != "server1.chromeConsole1":
+            await r.error("noSuchActor", f"No such actor for ID: {r.to}")
+            return
+        rid = f"rid-{next(server.actor_seq)}"
         await r.reply(resultID=rid)
         # A real instance interleaves unrelated events before the result.
         await r.event("frameUpdate", frames=[{"id": 7, "isTopLevel": True}])
@@ -227,42 +419,23 @@ def default_handlers(server: FakeRDPFirefox) -> None:
         end = int(msg.get("end", 0))
         await r.reply(substring=("x" * 100_000)[start:end])
 
-    async def get_watcher(msg: dict[str, Any], r: Responder) -> None:
-        server.watcher_alive = True
-        await r.reply(actor="server1.watcher3", traits={})
-
-    async def get_process(msg: dict[str, Any], r: Responder) -> None:
-        await r.reply(processDescriptor={"actor": "server1.processDescriptor3"})
-
-    async def watch_targets(msg: dict[str, Any], r: Responder) -> None:
-        await r.reply()
-
-    async def watch_resources(msg: dict[str, Any], r: Responder) -> None:
-        await r.reply()
-
-    async def unwatch_resources(msg: dict[str, Any], r: Responder) -> None:
-        # Faithful to Firefox: unwatching resources tears down the watcher actor,
-        # after which it stops answering anything else.
-        server.watcher_alive = False
-        await r.reply()
-
-    async def unwatch_targets(msg: dict[str, Any], r: Responder) -> None:
-        if not server.watcher_alive:
-            return  # actor is gone: no reply, exactly like the real thing
-        await r.reply()
+    async def never_answers(msg: dict[str, Any], r: Responder) -> None:
+        return
 
     server.handlers.update(
         {
             "listTabs": list_tabs,
+            "getWatcher": get_watcher,
+            "watchTargets": watch_targets,
+            "unwatchTargets": unwatch_targets,
+            "watchResources": watch_resources,
+            "unwatchResources": unwatch_resources,
+            "navigateTo": navigate_to,
+            "getProcess": get_process,
             "getTarget": get_target,
             "evaluateJSAsync": evaluate_js_async,
             "substring": substring,
-            "getWatcher": get_watcher,
-            "getProcess": get_process,
-            "watchTargets": watch_targets,
-            "watchResources": watch_resources,
-            "unwatchResources": unwatch_resources,
-            "unwatchTargets": unwatch_targets,
+            "neverAnswers": never_answers,
         }
     )
 

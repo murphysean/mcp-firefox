@@ -1,8 +1,4 @@
-"""Tests for the MCP tool layer: JSON contracts, capture parsing, screenshots.
-
-The tools are plain functions under the `@mcp.tool()` decorator, so they can be
-called directly. No network or browser is required for most of these.
-"""
+"""Tests for the MCP tool layer: JSON contracts, capture parsing, screenshots."""
 
 from __future__ import annotations
 
@@ -14,7 +10,7 @@ import pytest
 
 from firefox_mcp import server
 from firefox_mcp.rdp_client import RDPConnectionError
-from tests.test_rdp_client import connect  # reuse the connect helper
+from tests.test_rdp_client import connect
 
 
 @pytest.fixture
@@ -91,12 +87,18 @@ def test_capture_preserves_insertion_order():
     assert [e["resourceId"] for e in cap.summary()] == [3, 1, 2]
 
 
+def test_capture_ignores_non_network_resources():
+    cap = server._Capture(watcher_actor="w")
+    cap.add([{"resourceType": "console-message", "resourceId": 1}])
+    assert cap.summary() == []
+
+
 # ------------------------------------------------------------------- read_page
 
 
 async def test_read_page_returns_text(live):
     out = await live.read_page()
-    assert out == "ok"  # fake evaluates READ_PAGE js to the default probe value
+    assert out == "ok"
 
 
 async def test_read_page_reports_console_exception(live):
@@ -135,6 +137,11 @@ async def test_evaluate_js_supports_toplevel_await(live):
     assert out["hasException"] is False
 
 
+async def test_evaluate_js_accepts_tab_index(live):
+    out = load(await live.evaluate_js("1+1", tab_index=0))
+    assert out["result"] == 2
+
+
 # -------------------------------------------------------------------- list_tabs
 
 
@@ -145,22 +152,33 @@ async def test_list_tabs_includes_index(live):
     assert out[0]["title"] == "Tab One"
 
 
+async def test_list_tabs_marks_active_target(live):
+    await live.select_tab(0)
+    out = load(await live.list_tabs())
+    assert out[0]["is_active_target"] is True
+
+
 async def test_select_tab_by_index(live):
     out = load(await live.select_tab(0))
     assert out["status"] == "selected"
     assert out["title"] == "Tab One"
+    assert out["browsing_context_id"] == 10
 
 
 # -------------------------------------------------------------------- navigate
 
 
-async def test_navigate_invalidates_actors_and_reports_status(live, fake):
-    fake.handlers["navigateTo"] = lambda msg, r: r.reply()
-    out = load(await live.navigate("https://example.com/"))
-    assert out == {"status": "navigated", "url": "https://example.com/"}
-    # child actors must be forgotten so the next call re-resolves
-    assert live._client.target_actor is None
-    assert live._client.chrome_console_actor is None
+async def test_navigate_reports_new_target(live):
+    out = load(await live.navigate("https://example.com/next"))
+    assert out["status"] == "navigated"
+    assert out["url"] == "https://example.com/next"
+
+
+async def test_navigate_then_evaluate_uses_new_console(live):
+    """After navigation the very next call must hit the new console."""
+    await live.navigate("https://example.com/next")
+    out = load(await live.evaluate_js("1+1"))
+    assert out["result"] == 2
 
 
 # ------------------------------------------------------------------ screenshot
@@ -187,13 +205,13 @@ async def test_screenshot_save_path_writes_file(live, tmp_path):
 
 
 async def test_screenshot_reports_selector_not_found(live):
-    responses = ["null"]
-    live._client.evaluate = _fake_evaluate(*responses)
+    live._client.evaluate = _fake_evaluate("null")
     out = load(await live.screenshot(selector="#nope"))
-    assert out["error"] == "SelectorNotFound"
+    assert out["error"] == "RDPError"
+    assert "no element matches" in out["message"]
 
 
-async def test_screenshot_surfaces_chrome_exception(live, fake):
+async def test_screenshot_surfaces_chrome_exception(live):
     async def boom(actor, expr, **kw):
         return {
             "hasException": True,
@@ -225,10 +243,23 @@ async def test_screenshot_fullpage_measures_page_first(live):
     assert any("scrollWidth" in c for c in calls), "fullpage must measure the page"
 
 
+async def test_screenshot_reports_zero_size_selector(live):
+    live._client.evaluate = _fake_evaluate(json.dumps({"x": 0, "y": 0, "width": 0, "height": 0}))
+    out = load(await live.screenshot(selector="#empty"))
+    assert out["error"] == "RDPError"
+    assert "zero size" in out["message"]
+
+
 async def test_screenshot_bad_base64_is_reported(live, tmp_path):
     payload = {"data_url": "data:image/png;base64,!!!not-base64!!!", "width": 1, "height": 1}
     live._client.evaluate = _fake_evaluate(json.dumps(payload))
     out = load(await live.screenshot(save_path=str(tmp_path / "x.png")))
+    assert out["error"] == "ScreenshotFailed"
+
+
+async def test_screenshot_missing_image_data_is_reported(live):
+    live._client.evaluate = _fake_evaluate(json.dumps({"width": 1, "height": 1}))
+    out = load(await live.screenshot())
     assert out["error"] == "ScreenshotFailed"
 
 
@@ -249,7 +280,7 @@ def _fake_evaluate(*results):
 # --------------------------------------------------------------------- capture
 
 
-async def test_capture_lifecycle(live, fake):
+async def test_capture_lifecycle(live):
     out = load(await live.start_capture())
     assert out["status"] == "capturing"
 
@@ -265,10 +296,9 @@ async def test_read_capture_without_start_is_an_error(live):
     assert out["error"] == "NoCapture"
 
 
-async def test_read_capture_collects_events_from_rdp_batches(live, fake):
+async def test_read_capture_collects_events_from_rdp_batches(live):
     await live.start_capture()
 
-    # Simulate Firefox pushing a network-event batch in its nested shape.
     msg = {
         "array": [
             [
@@ -380,6 +410,21 @@ async def test_reconnect_reports_status(monkeypatch):
     monkeypatch.setattr(server, "DEFAULT_RDP_PORT", 1)
     out = load(await server.reconnect())
     assert out["status"] in {"failed", "reconnected"}
+
+
+async def test_reconnect_succeeds_against_live_firefox(fake, monkeypatch):
+    """reconnect() must rebuild the client and re-enumerate tabs."""
+    monkeypatch.setattr(server, "DEFAULT_RDP_HOST", "127.0.0.1")
+    monkeypatch.setattr(server, "DEFAULT_RDP_PORT", fake.port)
+    monkeypatch.setattr(server, "_client", None)
+    try:
+        out = load(await server.reconnect())
+        assert out["status"] == "reconnected"
+        assert out["tabs"] == 1
+    finally:
+        if server._client is not None:
+            await server._client.disconnect()
+        monkeypatch.setattr(server, "_client", None)
 
 
 def test_connection_error_surfaces_as_json():
